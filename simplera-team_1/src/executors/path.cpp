@@ -211,395 +211,613 @@ vector<bool> getNodeInfo(int src)
 }
 
 /**
- * @brief Retrieves edge attributes between src 
- * Uses Binary Search on SortedNodesTable to find the start of the edge list,
- * then linearly scans SortedEdgesTable to find out going edges from src
+ * @brief Retrieves outgoing edges from src.
+ * Returns raw rows from SE table starting at src's edge pointer.
+ * Each returned row is the SE row: [Source, Dest, ...]
  */
 vector<vector<int>> getEdgeInfo(int src)
 {
     string GraphName = parsedQuery.loadGraphRelationName;
     string type = (parsedQuery.graphType == DIRECTED) ? "D" : "U";
-    
-    // 1. Identify Tables
+
     string nodeTableName = GraphName + "_SN_Augmented_" + type;
     string edgeTableName = GraphName + "_SE_" + type;
 
     Table* nodeTable = tableCatalogue.getTable(nodeTableName);
     Table* edgeTable = tableCatalogue.getTable(edgeTableName);
-
     if (!nodeTable || !edgeTable) return {};
 
-    // ---------------------------------------------------------
-    // STEP 1: Find 'src' in SortedNodesTable (Binary Search)
-    // ---------------------------------------------------------
-    int low = 0;
-    int high = nodeTable->blockCount - 1;
+    // ---- Find src page in SN (binary search across blocks) ----
+    int low = 0, high = nodeTable->blockCount - 1;
     int nodePageIdx = -1;
-
     while (low <= high) {
         int mid = low + (high - low) / 2;
         int rowCount = nodeTable->rowsPerBlockCount[mid];
-        
-        if (rowCount == 0) {
-            high = mid - 1;
-            continue;
-        }
+        if (rowCount == 0) { high = mid - 1; continue; }
 
         Page page = bufferManager.getPage(nodeTableName, mid);
         int firstId = page.getRow(0)[0];
-        int lastId = page.getRow(rowCount - 1)[0];
+        int lastId  = page.getRow(rowCount - 1)[0];
 
-        if (src < firstId) {
-            high = mid - 1;
-        } else if (src > lastId) {
-            low = mid + 1;
-        } else {
-            nodePageIdx = mid;
-            break;
-        }
+        if (src < firstId) high = mid - 1;
+        else if (src > lastId) low = mid + 1;
+        else { nodePageIdx = mid; break; }
     }
+    if (nodePageIdx == -1) return {};
 
-    if (nodePageIdx == -1) return {}; // Source node not found in graph
-
-    // ---------------------------------------------------------
-    // STEP 2: Extract Start Indices from Node Table
-    // ---------------------------------------------------------
+    // ---- Extract edge start pointer from SN row ----
     Page nodePage = bufferManager.getPage(nodeTableName, nodePageIdx);
     int nodeRows = nodeTable->rowsPerBlockCount[nodePageIdx];
-    
-    int startEdgePage = -1;
-    int startEdgeRow = -1;
+
+    int startEdgePage = -1, startEdgeRow = -1;
     bool foundSrc = false;
 
     for (int i = 0; i < nodeRows; i++) {
         vector<int> row = nodePage.getRow(i);
         if (row[0] == src) {
-            // Last two columns are [edgePage, edgeRowIndex]
-            int cols = row.size();
+            int cols = (int)row.size();
             startEdgePage = row[cols - 2];
-            startEdgeRow = row[cols - 1];
+            startEdgeRow  = row[cols - 1];
             foundSrc = true;
             break;
         }
     }
+    if (!foundSrc || startEdgePage == -1 || startEdgeRow == -1) return {};
 
-    // If node exists but has no edges (indices are -1)
-    if (!foundSrc || startEdgePage == -1 || startEdgeRow == -1) return {}; 
-
-    // ---------------------------------------------------------
-    // STEP 3: Find 'dest' in SortedEdgesTable (Linear Scan)
-    // ---------------------------------------------------------
-    // We start exactly where the node told us to.
+    // ---- Scan SE from that pointer while Source==src ----
+    vector<vector<int>> edgeRows;
     int currPageIdx = startEdgePage;
     int currRowIdx = startEdgeRow;
 
-    vector<vector<int>> edgeinfo;
     while (currPageIdx < edgeTable->blockCount) {
         Page edgePage = bufferManager.getPage(edgeTableName, currPageIdx);
-        int edgeRows = edgeTable->rowsPerBlockCount[currPageIdx];
+        int edgeRowsCount = edgeTable->rowsPerBlockCount[currPageIdx];
 
-        // Iterate through rows in the current page
-        for (int r = currRowIdx; r < edgeRows; r++) {
+        for (int r = currRowIdx; r < edgeRowsCount; r++) {
             vector<int> row = edgePage.getRow(r);
-            
-            // Row Format: [Source, Dest, Attr1, Attr2...]
+            if (row.empty()) continue;
+
             int s = row[0];
-            int d = row[1];
-
             if (s != src) {
-                return edgeinfo; 
+                return edgeRows; // finished src's adjacency block
             }
 
-            vector<int> info;
-            for (size_t k = 1; k < row.size(); k++) {
-                info.push_back(row[k] != 0);
-            }
-
-            edgeinfo.push_back(info);
-        
+            edgeRows.push_back(row); // keep raw row, do NOT bool-convert
         }
+
+        // move to next page
+        currPageIdx++;
+        currRowIdx = 0;
     }
 
-        // Move to the next page, reset row index to 0
-    currPageIdx++;
-    currRowIdx = 0;
-
-        
-    return edgeinfo; // Edge (src -> dest) not found
+    return edgeRows;
 }
 
 
+// ---------- helpers to write tables ----------
 
-
-vector<bool> hadamardproduct(vector<bool> &v1, vector<bool> &v2, bool negate)
-{
-    vector<bool> prod(v1.size(), 0);
-    for (int i = 0; i < v1.size(); i++)
-    {
-        if (negate)
-            prod[i] = (!v1[i] & !v2[i]); 
-        else
-            prod[i] = (v1[i] & v2[i]);
+static void dropIfExists(const string &tableName) {
+    if (tableCatalogue.isTable(tableName)) {
+        tableCatalogue.deleteTable(tableName);
     }
-    return prod;
 }
 
-bool anyTruePrefix(const vector<bool>& v, int len) {
-    int L = len;
-    if (L < 0)
-        L = 0;
-    if (L > (int)v.size())
-        L = (int)v.size();
-    for (int i = 0; i < L; i++)
-        if (v[i]) return true;
-    return false;
+static void writeRowsToTable(Table *t, const string &name, const vector<vector<int>> &rows) {
+    // rows can be empty: then just keep blockCount=0,rowCount=0 and only header exists (from constructor)
+    t->rowCount = 0;
+    t->blockCount = 0;
+    t->rowsPerBlockCount.clear();
+
+    if (rows.empty()) return;
+
+    int maxR = (int)t->maxRowsPerBlock;
+    int pageIdx = 0;
+    vector<vector<int>> buf;
+    buf.reserve(maxR);
+
+    for (auto &r : rows) {
+        buf.push_back(r);
+        if ((int)buf.size() == maxR) {
+            bufferManager.writePage(name, pageIdx++, buf, (int)buf.size());
+            t->rowsPerBlockCount.push_back((int)buf.size());
+            t->rowCount += (int)buf.size();
+            t->blockCount++;
+            buf.clear();
+        }
+    }
+    if (!buf.empty()) {
+        bufferManager.writePage(name, pageIdx++, buf, (int)buf.size());
+        t->rowsPerBlockCount.push_back((int)buf.size());
+        t->rowCount += (int)buf.size();
+        t->blockCount++;
+    }
 }
 
+static void materializePathGraph(
+    const string &outGraph, const string &type,
+    const string &srcGraph,
+    const vector<int> &pathNodes,
+    const vector<vector<int>> &pathEdges,
+    int nodeAttrCount, int edgeAttrCount,
+    unordered_map<int, vector<bool>> &nodeCache
+) {
+    // Names expected by your semantic parser + getNodeInfo/getEdgeInfo
+    string outNodes = outGraph + "_Nodes_" + type;
+    string outEdges = outGraph + "_Edges_" + type;
+    string outSN    = outGraph + "_SN_"    + type;
+    string outSE    = outGraph + "_SE_"    + type;
+    string outSNA   = outGraph + "_SN_Augmented_" + type;
 
-void executePATH()
-{
-    /*
-    I need to basically run djiskstra while making sure i satisfy all the conditons 
-    1) need to check if the src and dest nodes exist
-    2) check if the conditions given are valid
-    
-    maintain a heap, add all the edges of the src node into it (if it satisfies the conditions)
-    to access the edges, use the SN table to obtain the offset of the edge table, index that page.
-    add the edge to the heap if
-    (i) dest satisfies node conditions
-    (ii) it satisfies the edge conditions
-    pop keep going until heap is empty 
-    maintain visited and heap in memory 
-    */
-   logger.log("executePATH");
-   int n;
-   int m;
-   int src = stoi(parsedQuery.src_node);
-   int dest = stoi(parsedQuery.dest_node);
-   //((attribute, N/E), 1/0/missing)
-   vector<pair<pair<string,bool>, char>> conditions = parsedQuery.path_condtions;
+    // Remove old versions if they exist
+    dropIfExists(outSNA);
+    dropIfExists(outSE);
+    dropIfExists(outSN);
+    dropIfExists(outEdges);
+    dropIfExists(outNodes);
 
-    vector<bool> srcNInfo = getNodeInfo(src);
-   // --- Build correct initial state for ANY(...) ---
-    // nodeinfo = [cand1 | cand0], size = 2*A
-    // cand1[i]: attribute i can still witness ANY(N)==1
-    // cand0[i]: attribute i can still witness ANY(N)==0
-    int A0 = (int)srcNInfo.size();
-    vector<bool> initNodeInfo(2 * A0, 0);
-    for (int i = 0; i < A0; i++)
+    // Use same column headers as the source graph if available; else synthesize.
+    vector<string> nodeCols, edgeCols;
     {
-        initNodeInfo[i] = srcNInfo[i];        // cand1 starts with src values
-        initNodeInfo[A0 + i] = !srcNInfo[i];  // cand0 starts as complement of src
-    }
+        Table *srcN = tableCatalogue.getTable(srcGraph + "_Nodes_" + type);
+        Table *srcE = tableCatalogue.getTable(srcGraph + "_Edges_" + type);
 
-    // slots for missing-== fixed EDGE attributes (Bj(E))
-    vector<int> missingEdgeSlot(conditions.size(), -1);
-    int missingEdgeCnt = 0;
-    for (int ci = 0; ci < (int)conditions.size(); ci++)
-    {
-        if (conditions[ci].second == 2 &&
-            conditions[ci].first.second == false)
-        {
-            missingEdgeSlot[ci] = missingEdgeCnt++;
+        if (srcN) nodeCols = srcN->columns;
+        if (srcE) edgeCols = srcE->columns;
+
+        if (nodeCols.empty()) {
+            nodeCols.push_back("NodeID");
+            for (int i = 1; i <= nodeAttrCount; i++) nodeCols.push_back("A" + to_string(i));
+        }
+        if (edgeCols.empty()) {
+            edgeCols.push_back("Src_NodeID");
+            edgeCols.push_back("Dest_NodeID");
+            edgeCols.push_back("Weight");
+            for (int j = 1; j <= edgeAttrCount; j++) edgeCols.push_back("B" + to_string(j));
         }
     }
 
-    priority_queue<heapNode, vector<heapNode>, compareheapNode> pq;
+    // Build Nodes rows in path order: [NodeID, A1..An]
+    vector<vector<int>> nodeRows;
+    nodeRows.reserve(pathNodes.size());
 
-    // edgeinfo prefix = [cand1 | cand0], size = 2*m
-    // tail = (isSet,value) for each missing-edge fixed condition
-    vector<bool> totEdgeInfo(2 * m, 1);
-    totEdgeInfo.resize(2 * m + 2 * missingEdgeCnt, 0);
+    for (int nid : pathNodes) {
+        if (nodeCache.find(nid) == nodeCache.end()) nodeCache[nid] = getNodeInfo(nid);
+        const auto &attrs = nodeCache[nid];
 
-    pq.push(heapNode({src, 0, initNodeInfo, totEdgeInfo}));
-   vector<long long> d(n, LONG_MAX);
-   d[src] = 0;
+        vector<int> r;
+        r.reserve(1 + nodeAttrCount);
+        r.push_back(nid);
+        for (int i = 0; i < nodeAttrCount; i++) r.push_back(attrs[i] ? 1 : 0);
+        nodeRows.push_back(std::move(r));
+    }
 
+    // Edges rows already in SE format: [Src, Dest, Weight, B1..Bm]
+    vector<vector<int>> edgeRows = pathEdges;
 
-   while(!pq.empty())
-   {
-    heapNode top = pq.top();
-    int v = top.node;
-    long long d_v = top.weight;
-    vector<bool> nodeInfo = top.nodeinfo;
-    vector<bool> edgeInfo = top.edgeinfo;
-    pq.pop();
+    // Create base tables
+    Table *tNodes = new Table(outNodes, nodeCols);
+    tableCatalogue.insertTable(tNodes);
+    writeRowsToTable(tNodes, outNodes, nodeRows);
 
-    int baseNodeAttr = (int)nodeInfo.size();                     // = 2*A
-    int baseEdgeAttr = (int)edgeInfo.size() - 2 * missingEdgeCnt; // = 2*m
+    Table *tEdges = new Table(outEdges, edgeCols);
+    tableCatalogue.insertTable(tEdges);
+    writeRowsToTable(tEdges, outEdges, edgeRows);
 
-    int A = baseNodeAttr / 2;  // node attribute count
-    int B = baseEdgeAttr / 2;  // edge attribute count
+    // Create sorted SN/SE (required by your semanticParsePATH existence checks + adjacency access)
+    vector<vector<int>> snRows = nodeRows;
+    vector<vector<int>> seRows = edgeRows;
+    sort(snRows.begin(), snRows.end());
+    sort(seRows.begin(), seRows.end());
 
+    Table *tSN = new Table(outSN, nodeCols);
+    tableCatalogue.insertTable(tSN);
+    writeRowsToTable(tSN, outSN, snRows);
 
-    //get outgoing edges from popped node. 
-    for (int i = 1; i < 1; i++)
-    {
-        int u;
-        int w;
-        vector<bool> uNInfo = getNodeInfo(u);
-        vector<bool> uEInfo = getEdgeInfo(v, u);
-        //check conditions
-        vector<bool> nextNodeState = nodeInfo;  
-        vector<bool> nextEdgeState = edgeInfo;
-        bool ok = true;
-        for(int ci = 0; ci < (int)conditions.size(); ci++)
-        {
-            auto condition = conditions[ci];
+    Table *tSE = new Table(outSE, edgeCols);
+    tableCatalogue.insertTable(tSE);
+    writeRowsToTable(tSE, outSE, seRows);
 
-            if(condition.second == 2)
-            {
-                int atrinum = stoi(condition.first.first.substr(1,string::npos)) - 1;
-                // true == N
-                if (condition.first.second) 
-                {
-                    if (uNInfo[atrinum] != srcNInfo[atrinum])
-                    {
-                        ok = false;
-                        break;
-                    }
-                }
-                // false == E
-                else 
-                {
-                    int slot = missingEdgeSlot[ci];
-                    if (slot < 0)
-                    {
-                        ok = false;
-                        break;
-                    }
+    // Build first-edge pointers for augmented SN
+    unordered_map<int, pair<int,int>> firstPtr; // node -> (page,row)
+    firstPtr.reserve(snRows.size() * 2);
 
-                    // isSet
-                    int flagPos = baseEdgeAttr + 2 * slot;
-                    //value       
-                    int valPos  = baseEdgeAttr + 2 * slot + 1;  
-
-                    if (!nextEdgeState[flagPos])
-                    {
-                        // First edge on this candidate path: set req uniform val
-                        nextEdgeState[flagPos] = true;
-                        nextEdgeState[valPos] = uEInfo[atrinum];
-                    }
-                    else
-                    {
-                        // subsequent edges match the chosen val
-                        if (nextEdgeState[valPos] != uEInfo[atrinum])
-                        {
-                            ok = false;
-                            break;
-                        }
-                    }
-                }
-            }
-            else if (condition.first.first == "ANY")
-            {
-                // true == N
-                if (condition.first.second)
-                {
-                    // Update candidate masks:
-                    // cand1[i] &= val(i), cand0[i] &= !val(i)
-                    for (int k = 0; k < A; k++)
-                    {
-                        bool val = false;
-                        if (k < (int)uNInfo.size())
-                            val = uNInfo[k];
-
-                        nextNodeState[k] = nextNodeState[k] & val;           // cand1
-                        nextNodeState[A + k] = nextNodeState[A + k] & (!val); // cand0
-                    }
-
-                    bool found = false;
-                    if (condition.second == 1)
-                    {
-                        // any candidate attribute remains for == 1
-                        found = anyTruePrefix(nextNodeState, A);
-                    }
-                    else
-                    {
-                        // any candidate attribute remains for == 0
-                        for (int k = 0; k < A; k++)
-                        {
-                            if (nextNodeState[A + k])
-                            {
-                                found = true;
-                                break;
-                            }
-                        }
-                    }
-
-                    if (!found)
-                    {
-                        ok = false;
-                        break;
-                    }
-                }
-                // false == E
-                else
-                {
-                    for (int k = 0; k < B; k++)
-                    {
-                        bool val = false;
-                        if (k < (int)uEInfo.size())
-                            val = uEInfo[k];
-
-                        nextEdgeState[k] = nextEdgeState[k] & val;            // cand1
-                        nextEdgeState[B + k] = nextEdgeState[B + k] & (!val); // cand0
-                    }
-
-                    bool found = false;
-                    if (condition.second == 1)
-                    {
-                        found = anyTruePrefix(nextEdgeState, B); // cand1 part
-                    }
-                    else
-                    {
-                        for (int k = 0; k < B; k++)
-                        {
-                            if (nextEdgeState[B + k])
-                            {
-                                found = true;
-                                break;
-                            }
-                        }
-                    }
-
-                    if (!found)
-                    {
-                        ok = false;
-                        break;
-                    }
-                }
-            }
-            else
-            {
-                int atrinum = stoi(condition.first.first.substr(1,string::npos)) - 1;
-                if(condition.first.second)
-                {
-                    if(uNInfo[atrinum] != condition.second)
-                    {
-                        ok = false;
-                        break; 
-                    }
-                }
-                // false == E
-                else
-                {
-                    if(uEInfo[atrinum] != condition.second)
-                    {
-                        ok = false;
-                        break; 
-                    }
-                }
-            }
-        }
-        if (ok && (d[v] + w < d[u]))
-        {
-            d[u] = d[v] + w;
-            pq.push(heapNode({u, d[u], nextNodeState, nextEdgeState}));
+    int seMax = (int)tSE->maxRowsPerBlock;
+    for (int i = 0; i < (int)seRows.size(); i++) {
+        int s = seRows[i][0];
+        if (firstPtr.find(s) == firstPtr.end()) {
+            firstPtr[s] = { i / seMax, i % seMax };
         }
     }
-   }
 
-   //push
-    return;
+    vector<string> augCols = nodeCols;
+    augCols.push_back("edgePage");
+    augCols.push_back("edgeRowIndex");
+
+    vector<vector<int>> snaRows;
+    snaRows.reserve(snRows.size());
+    for (auto &nr : snRows) {
+        int nid = nr[0];
+        auto it = firstPtr.find(nid);
+        int ep = -1, er = -1;
+        if (it != firstPtr.end()) { ep = it->second.first; er = it->second.second; }
+        vector<int> r = nr;
+        r.push_back(ep);
+        r.push_back(er);
+        snaRows.push_back(std::move(r));
+    }
+
+    Table *tSNA = new Table(outSNA, augCols);
+    tableCatalogue.insertTable(tSNA);
+    writeRowsToTable(tSNA, outSNA, snaRows);
+}
+
+// ---------- constraint helpers (same as before, no syntax/semantic prints) ----------
+
+static bool parseAttrIndexLoose(const string &name, char prefix, int &outIdx) {
+    if (name.size() < 2 || name[0] != prefix) return false;
+    for (size_t i = 1; i < name.size(); i++) if (!isdigit(name[i])) return false;
+    outIdx = stoi(name.substr(1));
+    return true;
+}
+
+static bool nodeSatisfies(const vector<bool> &attrs, const vector<pair<int,bool>> &reqs) {
+    for (auto &pr : reqs) {
+        int idx = pr.first; bool val = pr.second;
+        if (idx <= 0 || idx > (int)attrs.size()) return false;
+        if (attrs[idx - 1] != val) return false;
+    }
+    return true;
+}
+
+static bool edgeSatisfies(const vector<int> &edgeRow, const vector<pair<int,bool>> &reqs) {
+    for (auto &pr : reqs) {
+        int idx = pr.first; bool val = pr.second;
+        int col = 3 + (idx - 1);
+        if (col < 0 || col >= (int)edgeRow.size()) return false;
+        bool b = (edgeRow[col] != 0);
+        if (b != val) return false;
+    }
+    return true;
+}
+
+// ---------- Dijkstra over full product state with parents (ternary encoding) ----------
+
+struct ParentInfo {
+    bool has = false;
+    int prevNode = -1;
+    int prevCode = 0;
+    int edgeIdx = -1;  // index into edgeCache[prevNode]
+};
+
+static bool dijkstraTernaryStateWithPath(
+    int src, int dest,
+    const vector<pair<int,bool>> &nodeReq,
+    const vector<pair<int,bool>> &edgeReq,
+    const vector<int> &uniformEdgeIdx,
+    unordered_map<int, vector<bool>> &nodeCache,
+    unordered_map<int, vector<vector<int>>> &edgeCache,
+    long long &outDist,
+    vector<int> &outNodes,
+    vector<vector<int>> &outEdges
+) {
+    const long long INF = (1LL<<62);
+    int k = (int)uniformEdgeIdx.size();
+
+    // ternary powers
+    vector<int> pow3(k + 1, 1);
+    for (int i = 1; i <= k; i++) {
+        // assume k small; if not, just fail in "basic testing" mode
+        long long v = 1LL * pow3[i-1] * 3LL;
+        if (v > 20000000LL) return false;
+        pow3[i] = (int)v;
+    }
+    int S = pow3[k];
+
+    auto getNodeCached = [&](int id) -> const vector<bool>& {
+        auto it = nodeCache.find(id);
+        if (it != nodeCache.end()) return it->second;
+        nodeCache[id] = getNodeInfo(id);
+        return nodeCache[id];
+    };
+    auto getEdgesCached = [&](int id) -> const vector<vector<int>>& {
+        auto it = edgeCache.find(id);
+        if (it != edgeCache.end()) return it->second;
+        edgeCache[id] = getEdgeInfo(id);
+        return edgeCache[id];
+    };
+
+    struct PQ { long long d; int u; int code; };
+    struct Cmp { bool operator()(PQ const& a, PQ const& b) const { return a.d > b.d; } };
+
+    unordered_map<int, vector<long long>> dist;
+    unordered_map<int, vector<ParentInfo>> parent;
+    priority_queue<PQ, vector<PQ>, Cmp> pq;
+
+    dist[src] = vector<long long>(S, INF);
+    parent[src] = vector<ParentInfo>(S);
+    dist[src][0] = 0;
+    pq.push({0, src, 0});
+
+    int endCode = -1;
+
+    while (!pq.empty()) {
+        auto cur = pq.top(); pq.pop();
+        int u = cur.u, code = cur.code;
+        long long du = cur.d;
+
+        auto it = dist.find(u);
+        if (it == dist.end()) continue;
+        if (du != it->second[code]) continue;
+
+        if (u == dest) {
+            outDist = du;
+            endCode = code;
+            break;
+        }
+
+        const auto &adj = getEdgesCached(u);
+        for (int ei = 0; ei < (int)adj.size(); ei++) {
+            const auto &erow = adj[ei];
+            if ((int)erow.size() < 3) continue;
+
+            int v = erow[1];
+            long long w = (long long)erow[2];
+            if (w < 0) continue;
+            if (!edgeSatisfies(erow, edgeReq)) continue;
+
+            int newCode = code;
+            bool ok = true;
+            for (int j = 0; j < k; j++) {
+                int bj = uniformEdgeIdx[j]; // 1-based
+                int col = 3 + (bj - 1);
+                if (col < 0 || col >= (int)erow.size()) { ok = false; break; }
+
+                int wantDigit = (erow[col] != 0) ? 2 : 1; // 2=>1, 1=>0
+                int digit = (newCode / pow3[j]) % 3;
+
+                if (digit == 0) newCode += wantDigit * pow3[j];
+                else if (digit != wantDigit) { ok = false; break; }
+            }
+            if (!ok) continue;
+
+            const vector<bool> &vinfo = getNodeCached(v);
+            if (vinfo.empty()) continue;
+            if (!nodeSatisfies(vinfo, nodeReq)) continue;
+
+            long long nd = du + w;
+
+            if (dist.find(v) == dist.end()) {
+                dist[v] = vector<long long>(S, INF);
+                parent[v] = vector<ParentInfo>(S);
+            }
+
+            if (nd < dist[v][newCode]) {
+                dist[v][newCode] = nd;
+                parent[v][newCode] = ParentInfo{true, u, code, ei};
+                pq.push({nd, v, newCode});
+            }
+        }
+    }
+
+    if (endCode == -1) return false;
+
+    // Reconstruct path
+    vector<int> nodesRev;
+    vector<vector<int>> edgesRev;
+
+    int curNode = dest;
+    int curCode = endCode;
+
+    while (!(curNode == src && curCode == 0)) {
+        auto pit = parent.find(curNode);
+        if (pit == parent.end()) return false;
+        ParentInfo p = pit->second[curCode];
+        if (!p.has) return false;
+
+        // edge row is stored in edgeCache[p.prevNode][p.edgeIdx]
+        const auto &adjPrev = getEdgesCached(p.prevNode);
+        if (p.edgeIdx < 0 || p.edgeIdx >= (int)adjPrev.size()) return false;
+
+        edgesRev.push_back(adjPrev[p.edgeIdx]);
+        nodesRev.push_back(curNode);
+
+        curNode = p.prevNode;
+        curCode = p.prevCode;
+    }
+    nodesRev.push_back(src);
+
+    reverse(nodesRev.begin(), nodesRev.end());
+    reverse(edgesRev.begin(), edgesRev.end());
+
+    outNodes = std::move(nodesRev);
+    outEdges = std::move(edgesRev);
+    return true;
+}
+
+// ---------- executePATH: prints + saves graph when True ----------
+
+void executePATH() {
+    logger.log("executePATH");
+
+    int src = stoi(parsedQuery.src_node);
+    int dest = stoi(parsedQuery.dest_node);
+
+    // output graph name is LHS token (RES in "RES <- PATH ...")
+    string outGraph = tokenizedQuery[0];
+
+    string inGraph = parsedQuery.loadGraphRelationName;
+    string type = (parsedQuery.graphType == DIRECTED) ? "D" : "U";
+
+    // attribute counts from table headers (robust even if result is small)
+    Table *inNodesT = tableCatalogue.getTable(inGraph + "_Nodes_" + type);
+    Table *inEdgesT = tableCatalogue.getTable(inGraph + "_Edges_" + type);
+    if (!inNodesT || !inEdgesT) { cout << "False" << endl; return; }
+
+    int nodeAttrCount = (int)inNodesT->columnCount - 1; // NodeID + A...
+    int edgeAttrCount = (int)inEdgesT->columnCount - 3; // Src,Dest,Weight + B...
+
+    unordered_map<int, vector<bool>> nodeCache;
+    unordered_map<int, vector<vector<int>>> edgeCache;
+    nodeCache.reserve(1024);
+    edgeCache.reserve(1024);
+
+    vector<bool> srcInfo = getNodeInfo(src);
+    if (srcInfo.empty()) { cout << "Node does not exist" << endl; return; }
+    vector<bool> destInfo = getNodeInfo(dest);
+    if (destInfo.empty()) { cout << "Node does not exist" << endl; return; }
+
+    nodeCache[src] = srcInfo;
+    nodeCache[dest] = destInfo;
+
+    // Collect constraints (no error printing here)
+    vector<pair<int,bool>> baseNodeReq;
+    vector<pair<int,bool>> baseEdgeReq;
+    vector<int> uniformNodeIdx;
+    vector<int> uniformEdgeIdx;
+
+    struct AnyCond { bool isNode; bool val; };
+    vector<AnyCond> anyConds;
+
+    for (auto &c : parsedQuery.path_condtions) {
+        const string &attrName = c.first.first;
+        bool isNode = c.first.second;
+        int bc = (int)c.second; // 0,1,2
+
+        if (attrName == "ANY") {
+            if (bc == 2) { cout << "False" << endl; return; }
+            anyConds.push_back({isNode, bc == 1});
+            continue;
+        }
+
+        if (isNode) {
+            int idx = -1;
+            if (!parseAttrIndexLoose(attrName, 'A', idx)) { cout << "False" << endl; return; }
+            if (idx < 1 || idx > nodeAttrCount) { cout << "False" << endl; return; }
+            if (bc == 2) uniformNodeIdx.push_back(idx);
+            else baseNodeReq.push_back({idx, bc == 1});
+        } else {
+            int idx = -1;
+            if (!parseAttrIndexLoose(attrName, 'B', idx)) { cout << "False" << endl; return; }
+            if (idx < 1 || idx > edgeAttrCount) { cout << "False" << endl; return; }
+            if (bc == 2) uniformEdgeIdx.push_back(idx);
+            else baseEdgeReq.push_back({idx, bc == 1});
+        }
+    }
+
+    // Rewrite uniform node Aq(N) => Aq(N)==Aq(src)
+    for (int idx : uniformNodeIdx) baseNodeReq.push_back({idx, srcInfo[idx - 1]});
+
+    auto mergeReqs = [](int attrCount, const vector<pair<int,bool>> &reqs, vector<int8_t> &arr) -> bool {
+        arr.assign(attrCount + 1, -1);
+        for (auto &pr : reqs) {
+            int idx = pr.first;
+            int8_t v = pr.second ? 1 : 0;
+            if (arr[idx] != -1 && arr[idx] != v) return false;
+            arr[idx] = v;
+        }
+        return true;
+    };
+
+    vector<int8_t> baseNodeArr, baseEdgeArr;
+    if (!mergeReqs(nodeAttrCount, baseNodeReq, baseNodeArr)) { cout << "False" << endl; return; }
+    if (!mergeReqs(edgeAttrCount, baseEdgeReq, baseEdgeArr)) { cout << "False" << endl; return; }
+
+    auto arrToPairs = [](const vector<int8_t> &arr) {
+        vector<pair<int,bool>> req;
+        for (int i = 1; i < (int)arr.size(); i++) if (arr[i] != -1) req.push_back({i, arr[i] == 1});
+        return req;
+    };
+
+    // ANY candidates (cartesian product if multiple ANY)
+    vector<vector<int>> anyCandidates;
+    anyCandidates.reserve(anyConds.size());
+    for (auto &ac : anyConds) {
+        vector<int> cand;
+        if (ac.isNode) {
+            for (int i = 1; i <= nodeAttrCount; i++) {
+                if (srcInfo[i - 1] == ac.val && destInfo[i - 1] == ac.val) cand.push_back(i);
+            }
+        } else {
+            for (int j = 1; j <= edgeAttrCount; j++) cand.push_back(j);
+        }
+        if (cand.empty()) { cout << "False" << endl; return; }
+        anyCandidates.push_back(std::move(cand));
+    }
+
+    const long long INF = (1LL<<62);
+    long long best = INF;
+    bool found = false;
+    vector<int> bestNodes;
+    vector<vector<int>> bestEdges;
+
+    function<void(int, vector<int8_t>, vector<int8_t>)> dfs =
+        [&](int pos, vector<int8_t> nodeArr, vector<int8_t> edgeArr) {
+            if (pos == (int)anyConds.size()) {
+                vector<pair<int,bool>> nodeReq = arrToPairs(nodeArr);
+                vector<pair<int,bool>> edgeReq = arrToPairs(edgeArr);
+
+                if (!nodeSatisfies(srcInfo, nodeReq)) return;
+                if (!nodeSatisfies(destInfo, nodeReq)) return;
+
+                if (src == dest) {
+                    if (0 < best) {
+                        best = 0;
+                        found = true;
+                        bestNodes = {src};
+                        bestEdges.clear();
+                    }
+                    return;
+                }
+
+                long long d = 0;
+                vector<int> pNodes;
+                vector<vector<int>> pEdges;
+
+                bool ok = dijkstraTernaryStateWithPath(
+                    src, dest, nodeReq, edgeReq, uniformEdgeIdx,
+                    nodeCache, edgeCache, d, pNodes, pEdges
+                );
+
+                if (ok && d < best) {
+                    best = d;
+                    found = true;
+                    bestNodes = std::move(pNodes);
+                    bestEdges = std::move(pEdges);
+                }
+                return;
+            }
+
+            const auto &ac = anyConds[pos];
+            for (int idx : anyCandidates[pos]) {
+                int8_t want = ac.val ? 1 : 0;
+                if (ac.isNode) {
+                    if (nodeArr[idx] != -1 && nodeArr[idx] != want) continue;
+                    auto nodeArr2 = nodeArr;
+                    nodeArr2[idx] = want;
+                    dfs(pos + 1, std::move(nodeArr2), edgeArr);
+                } else {
+                    if (edgeArr[idx] != -1 && edgeArr[idx] != want) continue;
+                    auto edgeArr2 = edgeArr;
+                    edgeArr2[idx] = want;
+                    dfs(pos + 1, nodeArr, std::move(edgeArr2));
+                }
+            }
+        };
+
+    dfs(0, baseNodeArr, baseEdgeArr);
+
+    if (!found) {
+        cout << "False" << endl;
+        return;
+    }
+
+    cout << "True " << best << endl;
+
+    // Save result graph tables (Nodes/Edges + SN/SE + SN_Augmented)
+    materializePathGraph(
+        outGraph, type, inGraph,
+        bestNodes, bestEdges,
+        nodeAttrCount, edgeAttrCount,
+        nodeCache
+    );
 }

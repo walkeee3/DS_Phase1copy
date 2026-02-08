@@ -58,6 +58,8 @@ bool syntacticParse()
             return syntacticParsePROJECTION();
         else if (possibleQueryType == "SELECT")
             return syntacticParseSELECTION();
+        else if(possibleQueryType == "PATH")
+            return syntacticParsePATH();
         else if (possibleQueryType == "JOIN")
             return syntacticParseJOIN();
         else if (possibleQueryType == "CROSS")
@@ -86,6 +88,9 @@ void ParsedQuery::clear()
 
     this->graphType = UNKNOWN;
     this->loadGraphRelationName = "";
+    this->src_node = "";
+    this->dest_node = "";
+    this->path_condtions.clear();
 
     this->clearRelationName = "";
 

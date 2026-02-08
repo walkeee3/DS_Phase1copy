@@ -69,9 +69,9 @@ Page BufferManager::getFromPool(string pageName)
 Page BufferManager::insertIntoPool(string tableName, int pageIndex)
 {
     logger.log("BufferManager::insertIntoPool");
-    logger.log(tableName);
-    logger.log(to_string(pageIndex));
-    cout << tableName << " " << pageIndex;
+    // logger.log(tableName);
+    // logger.log(to_string(pageIndex));
+    // cout << tableName << " " << pageIndex;
     Page page(tableName, pageIndex);
     if (this->pages.size() >= BLOCK_COUNT)
         pages.pop_front();

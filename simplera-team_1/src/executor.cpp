@@ -19,6 +19,7 @@ void executeCommand(){
         case SOURCE: executeSOURCE(); break;
         case LOADGRAPH: executeLOADGRAPH(); break;
         case EXPORTGRAPH: executeEXPORTGRAPH(); break;
+        case PATH: executePATH(); break;
 
         default: cout<<"PARSING ERROR"<<endl;
     }
