@@ -211,11 +211,11 @@ vector<bool> getNodeInfo(int src)
 }
 
 /**
- * @brief Retrieves edge attributes between src and dest.
+ * @brief Retrieves edge attributes between src 
  * Uses Binary Search on SortedNodesTable to find the start of the edge list,
- * then linearly scans SortedEdgesTable to find the specific destination.
+ * then linearly scans SortedEdgesTable to find out going edges from src
  */
-vector<bool> getEdgeInfo(int src, int dest)
+vector<vector<int>> getEdgeInfo(int src)
 {
     string GraphName = parsedQuery.loadGraphRelationName;
     string type = (parsedQuery.graphType == DIRECTED) ? "D" : "U";
@@ -293,6 +293,7 @@ vector<bool> getEdgeInfo(int src, int dest)
     int currPageIdx = startEdgePage;
     int currRowIdx = startEdgeRow;
 
+    vector<vector<int>> edgeinfo;
     while (currPageIdx < edgeTable->blockCount) {
         Page edgePage = bufferManager.getPage(edgeTableName, currPageIdx);
         int edgeRows = edgeTable->rowsPerBlockCount[currPageIdx];
@@ -306,28 +307,28 @@ vector<bool> getEdgeInfo(int src, int dest)
             int d = row[1];
 
             if (s != src) {
-                // We moved past the block of edges for 'src'. 
-                // Since edges are sorted by source, we can stop early.
-                return {}; 
+                return edgeinfo; 
             }
 
-            if (d == dest) {
-                // Found the edge! Return attributes (skip first 2 cols)
-                vector<bool> info;
-                for (size_t k = 2; k < row.size(); k++) {
-                    info.push_back(row[k] != 0);
-                }
-                return info;
+            vector<int> info;
+            for (size_t k = 1; k < row.size(); k++) {
+                info.push_back(row[k] != 0);
             }
+
+            edgeinfo.push_back(info);
+        
         }
-
-        // Move to the next page, reset row index to 0
-        currPageIdx++;
-        currRowIdx = 0;
     }
 
-    return {}; // Edge (src -> dest) not found
+        // Move to the next page, reset row index to 0
+    currPageIdx++;
+    currRowIdx = 0;
+
+        
+    return edgeinfo; // Edge (src -> dest) not found
 }
+
+
 
 
 vector<bool> hadamardproduct(vector<bool> &v1, vector<bool> &v2, bool negate)
